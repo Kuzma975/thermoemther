@@ -207,7 +207,7 @@ void setup() {
   savedBat = readBatteryVoltage();
 
   if(isDisplayEnabled) {
-    display.ssd1306_command(SSD1306_DISPLAYON);
+    // display.ssd1306_command(SSD1306_DISPLAYON);
     display.ssd1306_command(SSD1306_SETCONTRAST);
     display.ssd1306_command(1);
     drawScreen();
@@ -221,16 +221,16 @@ void setup() {
   // connectAndSync();
 
   // 3. Фінальна перевірка перед сном
-  if (!isDisplayEnabled) {
-     // Переконуємось, що екран вимкнено перед сном
-     display.clearDisplay();
-     display.display();
-     display.ssd1306_command(SSD1306_DISPLAYOFF); 
-  } else {
-     // Якщо увімкнено - оновлюємо дані (показуємо, що відправлено)
-     display.ssd1306_command(SSD1306_DISPLAYON);
-     // Можна домалювати галочку "Sent" тут
-  }
+  // if (!isDisplayEnabled) {
+  //    // Переконуємось, що екран вимкнено перед сном
+  //    display.clearDisplay();
+  //    display.display();
+  //    display.ssd1306_command(SSD1306_DISPLAYOFF); 
+  // } else {
+  //    // Якщо увімкнено - оновлюємо дані (показуємо, що відправлено)
+  //    display.ssd1306_command(SSD1306_DISPLAYON);
+  //    // Можна домалювати галочку "Sent" тут
+  // }
 
   // bootCount++;
   // drawScreen();
