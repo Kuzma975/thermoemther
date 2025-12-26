@@ -2,7 +2,10 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_AHTX0.h>
-#include "esp_sleep.h"
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <esp_sleep.h>
+#include "secrets.h"
 
 // --- Налаштування пінів ---
 #define I2C_SDA 8
@@ -10,7 +13,7 @@
 #define BAT_PIN 3        // Пін для зчитування напруги (ADC)
 
 // --- Налаштування сну ---
-#define TIME_TO_SLEEP  60        
+#define TIME_TO_SLEEP  30        
 #define uS_TO_S_FACTOR 1000000ULL 
 
 // --- Дисплей ---
@@ -18,14 +21,106 @@
 #define SCREEN_HEIGHT 64
 #define SCREEN_ADDRESS 0x3C
 
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
+const char* mqtt_server = MQTT_SERVER;
+const char* mqtt_topic_sensor = "home/livingroom/sensor";
+const char* mqtt_topic_set = "home/livingroom/display/set"; // Топік для керування
+const char* mqtt_user = MQTT_USER; // Якщо потрібена автентифікація
+const char* mqtt_pass = MQTT_PASSWORD;
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 Adafruit_AHTX0 aht;
+WiFiClient espClient;
+PubSubClient client(espClient);
 
 // Змінні у пам'яті RTC
 RTC_DATA_ATTR float savedTemp = 0;
 RTC_DATA_ATTR float savedHum = 0;
 RTC_DATA_ATTR float savedBat = 0; // Зберігаємо вольтаж
-RTC_DATA_ATTR int bootCount = 0;
+// RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR bool isDisplayEnabled = true; // Стан дисплея (за замовчуванням увімкнено)
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  // Якщо прийшло "OFF" або "0" - вимикаємо
+  if (message == "OFF" || message == "0" || message == "false") {
+    isDisplayEnabled = false;
+  } 
+  // Якщо прийшло "ON" або "1" - вмикаємо
+  else if (message == "ON" || message == "1" || message == "true") {
+    isDisplayEnabled = true;
+  }
+}
+
+void connectAndSync() {
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    client.setServer(mqtt_server, 1883);
+    client.setCallback(callback); // Встановлюємо функцію слухача
+
+    if (client.connect("ESP32_Sensor", mqtt_user, mqtt_pass)) {
+      
+      // 1. Підписуємось на топік керування
+      client.subscribe(mqtt_topic_set);
+      
+      // 2. Даємо час MQTT брокеру надіслати нам "утримане" повідомлення
+      // Це критично важливо! Без loop() і затримки ми не встигнемо отримати команду.
+      for(int i=0; i<10; i++) {
+        client.loop(); 
+        delay(500);
+      }
+
+      // 3. Відправляємо дані сенсорів
+      String json = "{";
+      json += "\"temperature\":" + String(savedTemp, 1) + ",";
+      json += "\"humidity\":" + String(savedHum, 1) + ",";
+      json += "\"voltage\":" + String(savedBat, 2) + ",";
+      // Додамо статус дисплея, щоб HA знав поточний стан
+      json += "\"display_status\":\"" + String(isDisplayEnabled ? "ON" : "OFF") + "\"";
+      json += "}";
+      bool success = client.publish(mqtt_topic_sensor, json.c_str(), true);
+
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 10);
+      if(success) {
+        display.print("Data Sent!");
+      } else {
+        display.print("Send Fail!");
+      }
+      display.display();
+
+      delay(1500); // Час на відправку
+    } else {
+      // Помилка підключення до MQTT
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 10);
+      display.print("MQTT Fail");
+      display.display();
+      delay(1500);
+    }
+  } else {
+    // Помилка підключення до WiFi
+    display.clearDisplay();
+    display.setTextSize(2);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 10);
+    display.print("WiFi Fail");
+    display.display();
+    delay(1500);
+  }
+}
 
 // Функція для читання та розрахунку напруги
 float readBatteryVoltage() {
@@ -98,8 +193,6 @@ void setup() {
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     return; 
   }
-  display.ssd1306_command(SSD1306_SETCONTRAST);
-  display.ssd1306_command(1);
 
   if (!aht.begin()) {
     // Якщо датчик не знайдено (можна додати обробку)
@@ -113,8 +206,34 @@ void setup() {
   // Зчитуємо батарею
   savedBat = readBatteryVoltage();
 
-  bootCount++;
-  drawScreen();
+  if(isDisplayEnabled) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    display.ssd1306_command(SSD1306_SETCONTRAST);
+    display.ssd1306_command(1);
+    drawScreen();
+  } else {
+    display.clearDisplay();
+    display.display();
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+
+  // 2. Підключення до мережі та перевірка нових команд
+  // connectAndSync();
+
+  // 3. Фінальна перевірка перед сном
+  if (!isDisplayEnabled) {
+     // Переконуємось, що екран вимкнено перед сном
+     display.clearDisplay();
+     display.display();
+     display.ssd1306_command(SSD1306_DISPLAYOFF); 
+  } else {
+     // Якщо увімкнено - оновлюємо дані (показуємо, що відправлено)
+     display.ssd1306_command(SSD1306_DISPLAYON);
+     // Можна домалювати галочку "Sent" тут
+  }
+
+  // bootCount++;
+  // drawScreen();
 
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
   esp_deep_sleep_start();
