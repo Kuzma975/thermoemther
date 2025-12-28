@@ -1,0 +1,465 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_AHTX0.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <WiFiManager.h> // Встановити через бібліотеки!
+#include <Preferences.h> // Вбудована бібліотека для зберігання налаштувань
+#include "esp_sleep.h"
+
+// --- ПІНИ ---
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define BAT_PIN 3
+#define BTN_DISP_PIN  4  // Кнопка перемикання дисплея
+#define BTN_CONFIG_PIN 5 // Кнопка входу в налаштування
+
+// --- КОНСТАНТИ ---
+#define uS_TO_S_FACTOR 1000000ULL
+
+// --- ОБ'ЄКТИ ---
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_AHTX0 aht;
+WiFiClient espClient;
+PubSubClient client(espClient);
+Preferences preferences; // Для зберігання налаштувань у Flash пам'яті
+
+// --- ЗМІННІ RTC (Живуть у сні) ---
+RTC_DATA_ATTR bool isDisplayEnabled = true; 
+
+// --- ЗМІННІ КОНФІГУРАЦІЇ (Зчитуються з пам'яті) ---
+char mqtt_server[40];
+char mqtt_port[6] = "1883";
+char mqtt_user[20];
+char mqtt_pass[20];
+char mqtt_topic[40] = "home/sensor";
+int  sleep_interval = 5; // хвилини
+int  contrast = 128;
+bool send_to_ha = true;
+
+// --- ФУНКЦІЇ ---
+
+void loadSettings() {
+  preferences.begin("config", true); // true = read only
+  
+  // Якщо ключів немає - беруться значення за замовчуванням
+  String s_serv = preferences.getString("mqtt_server", "192.168.1.100");
+  s_serv.toCharArray(mqtt_server, 40);
+  
+  String s_port = preferences.getString("mqtt_port", "1883");
+  s_port.toCharArray(mqtt_port, 6);
+  
+  String s_user = preferences.getString("mqtt_user", "user");
+  s_user.toCharArray(mqtt_user, 20);
+
+  String s_pass = preferences.getString("mqtt_pass", "pass");
+  s_pass.toCharArray(mqtt_pass, 20);
+
+  String s_topic = preferences.getString("mqtt_topic", "home/livingroom");
+  s_topic.toCharArray(mqtt_topic, 40);
+
+  sleep_interval = preferences.getInt("interval", 5);
+  contrast = preferences.getInt("contrast", 128);
+  send_to_ha = preferences.getBool("send_ha", true);
+  
+  preferences.end();
+}
+
+void saveConfigCallback() {
+  // Ця функція викликається, коли WiFiManager зберіг нові дані
+  Serial.println("Saving config...");
+}
+
+void startConfigMode() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.println("CONFIG MODE");
+  display.println("Connect to WiFi:");
+  display.println("ESP32-Setup");
+  display.println("IP: 192.168.4.1");
+  display.display();
+  display.ssd1306_command(SSD1306_DISPLAYON);
+
+  WiFiManager wm;
+  
+  // Додаємо власні поля на сторінку налаштувань
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT Server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "MQTT Port", mqtt_port, 6);
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT User", mqtt_user, 20);
+  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT Pass", mqtt_pass, 20);
+  WiFiManagerParameter custom_mqtt_topic("topic", "Topic", mqtt_topic, 40);
+  
+  // Для чисел треба конвертація
+  char c_interval[5]; itoa(sleep_interval, c_interval, 10);
+  WiFiManagerParameter custom_interval("interval", "Sleep (min)", c_interval, 5);
+
+  char c_contrast[4]; itoa(contrast, c_contrast, 10);
+  WiFiManagerParameter custom_contrast("contrast", "Contrast (0-255)", c_contrast, 4);
+
+  // Чекбокс для відправки (трохи милиця в WiFiManager, але працює через поле)
+  char c_send[2]; strcpy(c_send, send_to_ha ? "1" : "0");
+  WiFiManagerParameter custom_send("send", "Send to HA (1/0)", c_send, 2);
+
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_port);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_pass);
+  wm.addParameter(&custom_mqtt_topic);
+  wm.addParameter(&custom_interval);
+  wm.addParameter(&custom_contrast);
+  wm.addParameter(&custom_send);
+
+  wm.setSaveConfigCallback(saveConfigCallback);
+
+  // Створюємо точку доступу, якщо не підключились
+  if (!wm.autoConnect("ESP32-Setup")) {
+    Serial.println("Failed to connect and hit timeout");
+    delay(3000);
+    ESP.restart();
+  }
+
+  // Якщо ми тут - значить користувач зберіг налаштування
+  preferences.begin("config", false); // false = read/write
+  
+  preferences.putString("mqtt_server", custom_mqtt_server.getValue());
+  preferences.putString("mqtt_port", custom_mqtt_port.getValue());
+  preferences.putString("mqtt_user", custom_mqtt_user.getValue());
+  preferences.putString("mqtt_pass", custom_mqtt_pass.getValue());
+  preferences.putString("mqtt_topic", custom_mqtt_topic.getValue());
+  
+  preferences.putInt("interval", atoi(custom_interval.getValue()));
+  preferences.putInt("contrast", atoi(custom_contrast.getValue()));
+  preferences.putBool("send_ha", atoi(custom_send.getValue()) == 1);
+  
+  preferences.end();
+
+  display.clearDisplay();
+  display.println("Saved! Restarting...");
+  display.display();
+  delay(2000);
+  ESP.restart();
+}
+
+float readBattery() {
+    long sum = 0;
+    for(int i=0; i<10; i++) { sum += analogRead(BAT_PIN); delay(2); }
+    return (sum / 10.0 / 4095.0) * 3.3 * 2.0 * 1.05; 
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Налаштування пінів кнопок
+  pinMode(BTN_DISP_PIN, INPUT_PULLUP);
+  pinMode(BTN_CONFIG_PIN, INPUT_PULLUP);
+
+  // Вмикаємо I2C та Дисплей
+  Wire.begin(I2C_SDA, I2C_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  // 1. ПЕРЕВІРКА ПРИЧИНИ ПРОБУДЖЕННЯ
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+
+  // Якщо прокинулись від кнопки Дисплея (Ext0 або Ext1)
+  // Або перевіряємо стан кнопки просто зараз
+  if (digitalRead(BTN_DISP_PIN) == LOW) {
+      isDisplayEnabled = !isDisplayEnabled; // Інвертуємо стан
+      // Покажемо повідомлення
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(10, 20);
+      display.print(isDisplayEnabled ? "Display ON" : "Display OFF");
+      display.display();
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      delay(1000); 
+  }
+
+  // Якщо прокинулись і натиснута кнопка КОНФІГУРАЦІЇ
+  if (digitalRead(BTN_CONFIG_PIN) == LOW) {
+      startConfigMode(); // Заходимо в режим налаштування (точка доступу)
+  }
+
+  // 2. ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ
+  loadSettings();
+  
+  // Встановлюємо контрастність
+  display.ssd1306_command(SSD1306_SETCONTRAST);
+  display.ssd1306_command(contrast);
+
+  // 3. ОСНОВНА РОБОТА
+  if (!aht.begin()) { Serial.println("AHT Error"); }
+  sensors_event_t h, t;
+  aht.getEvent(&h, &t);
+  float bat = readBattery();
+
+  // Малюємо (якщо дозволено)
+  if (isDisplayEnabled) {
+      display.clearDisplay();
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0,0);
+      display.print("Bat: "); display.print(bat, 2); display.println("V");
+      display.setTextSize(2);
+      display.print(t.temperature, 1); display.println("C");
+      display.print(h.relative_humidity, 1); display.println("%");
+      display.display();
+      display.ssd1306_command(SSD1306_DISPLAYON);
+  } else {
+      display.clearDisplay();
+      display.display();
+      display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+
+  // 4. ВІДПРАВКА MQTT (Якщо дозволено)
+  if (send_to_ha) {
+     // Щоб не підключатись до Wi-Fi дарма, робимо це тільки якщо треба слати
+     WiFi.begin(); // Беремо збережені WiFiManager-ом дані
+     
+     int attempts = 0;
+     while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(200); attempts++; }
+     
+     if (WiFi.status() == WL_CONNECTED) {
+         client.setServer(mqtt_server, atoi(mqtt_port));
+         if (client.connect("ESP32_Pro", mqtt_user, mqtt_pass)) {
+             String json = "{";
+             json += "\"temperature\":" + String(t.temperature, 1) + ",";
+             json += "\"humidity\":" + String(h.relative_humidity, 1) + ",";
+             json += "\"voltage\":" + String(bat, 2);
+             json += "}";
+             client.publish(mqtt_topic, json.c_str(), true);
+             delay(200);
+         }
+     }
+  }
+
+  // 5. НАЛАШТУВАННЯ НАСТУПНОГО СНУ
+  // Прокидатись по таймеру
+  esp_sleep_enable_timer_wakeup(sleep_interval * 60 * uS_TO_S_FACTOR);
+  
+  // Прокидатись, якщо натиснуто кнопки (рівень LOW)
+  // Для ESP32-C3 краще використовувати gpio_wakeup або ext1
+  // Тут простий варіант для C3, що дозволяє будь-якому GPIO будити
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_DISP_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_CONFIG_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+
+  Serial.println("Sleep...");
+  esp_deep_sleep_start();
+}
+
+void loop() {}
+
+
+
+====
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+void setup() {
+  // Вимикаємо детектор просідання напруги
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  // ... ваш код далі
+}
+
+WiFi.mode(WIFI_STA);
+// Зменшуємо потужність до 8.5dBm (цього достатньо для кімнати)
+// Можливі варіанти: WIFI_POWER_19_5dBm (макс), 11dBm, 8.5dBm, 5dBm
+WiFi.setTxPower(WIFI_POWER_8_5dBm); 
+
+WiFi.begin(ssid, password);
+
+
+=====
+
+
+// Функція авто-конфігурації для Home Assistant
+void sendDiscovery() {
+  // Унікальний ID вашого чіпа (щоб пристрої не плутались, якщо їх буде багато)
+  String chipId = String((uint32_t)ESP.getEfuseMac(), HEX); 
+  String deviceName = "Climate Sensor " + chipId;
+  String deviceId = "esp32_supermini_" + chipId;
+
+  // Спільний блок "device" для всіх сутностей (щоб вони були в одній картці)
+  String deviceJson = "\"device\":{";
+  deviceJson += "\"identifiers\":[\"" + deviceId + "\"],";
+  deviceJson += "\"name\":\"" + deviceName + "\",";
+  deviceJson += "\"model\":\"ESP32-C3 SuperMini\",";
+  deviceJson += "\"manufacturer\":\"DIY\"";
+  deviceJson += "}";
+
+  // --- 1. ТЕМПЕРАТУРА ---
+  // Топік конфігурації: homeassistant/sensor/esp32_XXXX/temp/config
+  String topic_temp = "homeassistant/sensor/" + deviceId + "/temp/config";
+  
+  String payload_temp = "{";
+  payload_temp += "\"name\": \"Temperature\",";
+  payload_temp += "\"unique_id\": \"" + deviceId + "_temp\","; // Важливо для UI
+  payload_temp += "\"device_class\": \"temperature\",";
+  payload_temp += "\"unit_of_measurement\": \"°C\",";
+  payload_temp += "\"state_topic\": \"" + String(mqtt_topic) + "\","; // Ваш топік даних
+  payload_temp += "\"value_template\": \"{{ value_json.temperature }}\",";
+  payload_temp += deviceJson; // Додаємо інфо про девайс
+  payload_temp += "}";
+
+  client.publish(topic_temp.c_str(), payload_temp.c_str(), true); // Retain = true
+
+  // --- 2. ВОЛОГІСТЬ ---
+  String topic_hum = "homeassistant/sensor/" + deviceId + "/hum/config";
+  
+  String payload_hum = "{";
+  payload_hum += "\"name\": \"Humidity\",";
+  payload_hum += "\"unique_id\": \"" + deviceId + "_hum\",";
+  payload_hum += "\"device_class\": \"humidity\",";
+  payload_hum += "\"unit_of_measurement\": \"%\",";
+  payload_hum += "\"state_topic\": \"" + String(mqtt_topic) + "\",";
+  payload_hum += "\"value_template\": \"{{ value_json.humidity }}\",";
+  payload_hum += deviceJson;
+  payload_hum += "}";
+
+  client.publish(topic_hum.c_str(), payload_hum.c_str(), true);
+
+  // --- 3. БАТАРЕЯ ---
+  String topic_bat = "homeassistant/sensor/" + deviceId + "/bat/config";
+  
+  String payload_bat = "{";
+  payload_bat += "\"name\": \"Battery\",";
+  payload_bat += "\"unique_id\": \"" + deviceId + "_bat\",";
+  payload_bat += "\"device_class\": \"voltage\",";
+  payload_bat += "\"unit_of_measurement\": \"V\",";
+  payload_bat += "\"state_topic\": \"" + String(mqtt_topic) + "\",";
+  payload_bat += "\"value_template\": \"{{ value_json.voltage }}\",";
+  payload_bat += deviceJson;
+  payload_bat += "}";
+
+  client.publish(topic_bat.c_str(), payload_bat.c_str(), true);
+  
+  // --- 4. КНОПКА ЕКРАНУ (Switch) ---
+  // Щоб HA сам створив перемикач
+  String topic_sw = "homeassistant/switch/" + deviceId + "/display/config";
+  
+  String payload_sw = "{";
+  payload_sw += "\"name\": \"Display Switch\",";
+  payload_sw += "\"unique_id\": \"" + deviceId + "_disp_sw\",";
+  payload_sw += "\"command_topic\": \"" + String(mqtt_topic) + "/set\","; // Топік команд
+  payload_sw += "\"payload_on\": \"ON\",";
+  payload_sw += "\"payload_off\": \"OFF\",";
+  payload_sw += deviceJson;
+  payload_sw += "}";
+  
+  client.publish(topic_sw.c_str(), payload_sw.c_str(), true);
+
+  Serial.println("Discovery sent!");
+  delay(500); // Дати час на відправку великих пакетів
+}
+
+
+====
+
+#include <ESPmDNS.h>
+
+// Функція для пошуку IP адреси брокера
+IPAddress findMqttBroker() {
+  Serial.println("Starting mDNS discovery...");
+  
+  if (!MDNS.begin("esp32-scanner")) {
+    Serial.println("Error setting up MDNS responder!");
+    return IPAddress(0, 0, 0, 0); // Повертаємо пустий IP
+  }
+
+  // ВАРІАНТ 1: Шукаємо конкретне ім'я хоста (найшвидше і надійніше для HA)
+  // Зазвичай Home Assistant називається "homeassistant" або "homeassistant.local"
+  Serial.println("Resolving 'homeassistant.local'...");
+  IPAddress brokerIP = MDNS.queryHost("homeassistant");
+  
+  if (brokerIP != IPAddress(0, 0, 0, 0)) {
+    Serial.print("Found via Hostname: ");
+    Serial.println(brokerIP);
+    return brokerIP;
+  }
+
+  // ВАРІАНТ 2: Шукаємо сервіс MQTT (_mqtt._tcp)
+  // Це працює, тільки якщо ваш брокер налаштований анонсувати себе (Mosquitto це вміє)
+  Serial.println("Browsing for _mqtt._tcp service...");
+  int n = MDNS.queryService("mqtt", "tcp");
+  
+  if (n > 0) {
+    // Беремо перший знайдений
+    brokerIP = MDNS.IP(0);
+    int port = MDNS.port(0); // Можна навіть порт дізнатись автоматично!
+    Serial.print("Found Service at: ");
+    Serial.print(brokerIP);
+    Serial.print(":");
+    Serial.println(port);
+    return brokerIP;
+  }
+
+  Serial.println("Broker not found via mDNS.");
+  return IPAddress(0, 0, 0, 0);
+}
+
+
+// ... ваші includes та змінні ...
+
+void setup() {
+  // ... ініціалізація ...
+  loadSettings(); // Завантажуємо налаштування (там може бути старий IP)
+
+  if (send_to_ha) {
+     WiFi.begin(); 
+     // ... чекаємо підключення до WiFi ...
+     
+     if (WiFi.status() == WL_CONNECTED) {
+         
+         // 1. Спробуємо підключитись за збереженою адресою (або налаштованою вручну)
+         // Якщо у нас збережено ім'я хоста, а не IP, це не спрацює з WiFiClient без DNS
+         // Тому краще оперувати IP
+         
+         IPAddress targetIP;
+         // Перевіряємо, чи те, що в налаштуваннях схоже на IP
+         if (!targetIP.fromString(mqtt_server)) {
+            // Якщо в налаштуваннях пусто або не IP, вважаємо, що IP невідомий
+            targetIP = IPAddress(0,0,0,0); 
+         }
+
+         client.setServer(targetIP, atoi(mqtt_port));
+         
+         bool connected = false;
+         
+         // Пробуємо підключитись, якщо IP валідний
+         if (targetIP != IPAddress(0,0,0,0)) {
+            connected = client.connect("ESP32_Pro", mqtt_user, mqtt_pass);
+         }
+
+         // 2. ЯКЩО НЕ ПІДКЛЮЧИЛИСЬ -> ЗАПУСКАЄМО ПОШУК (AUTODISCOVERY)
+         if (!connected) {
+             Serial.println("Direct connection failed. Searching for broker...");
+             
+             IPAddress newIP = findMqttBroker();
+             
+             if (newIP != IPAddress(0,0,0,0)) {
+                 // Знайшли! Пробуємо підключитись з новим IP
+                 client.setServer(newIP, atoi(mqtt_port));
+                 if (client.connect("ESP32_Pro", mqtt_user, mqtt_pass)) {
+                     Serial.println("Connected to new IP!");
+                     
+                     // 3. ЗБЕРІГАЄМО НОВИЙ IP В ПАМ'ЯТЬ
+                     // Щоб наступного разу не шукати
+                     preferences.begin("config", false);
+                     preferences.putString("mqtt_server", newIP.toString());
+                     preferences.end();
+                     
+                     connected = true;
+                 }
+             }
+         }
+
+         // Якщо підключились - відправляємо дані
+         if (connected) {
+             // ... відправка JSON ...
+         }
+     }
+  }
+  // ... сон ...
+}

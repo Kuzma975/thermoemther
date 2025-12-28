@@ -38,7 +38,7 @@ PubSubClient client(espClient);
 RTC_DATA_ATTR float savedTemp = 0;
 RTC_DATA_ATTR float savedHum = 0;
 RTC_DATA_ATTR float savedBat = 0; // Зберігаємо вольтаж
-// RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR bool isDisplayEnabled = true; // Стан дисплея (за замовчуванням увімкнено)
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -75,7 +75,7 @@ void connectAndSync() {
       // Це критично важливо! Без loop() і затримки ми не встигнемо отримати команду.
       for(int i=0; i<10; i++) {
         client.loop(); 
-        delay(500);
+        delay(50);
       }
 
       // 3. Відправляємо дані сенсорів
@@ -85,6 +85,7 @@ void connectAndSync() {
       json += "\"voltage\":" + String(savedBat, 2) + ",";
       // Додамо статус дисплея, щоб HA знав поточний стан
       json += "\"display_status\":\"" + String(isDisplayEnabled ? "ON" : "OFF") + "\"";
+      json += "\"boot_count\":\"" + String(bootCount) + "\"";
       json += "}";
       bool success = client.publish(mqtt_topic_sensor, json.c_str(), true);
 
@@ -99,7 +100,7 @@ void connectAndSync() {
       }
       display.display();
 
-      delay(1500); // Час на відправку
+      delay(100); // Час на відправку
     } else {
       // Помилка підключення до MQTT
       display.clearDisplay();
@@ -232,7 +233,7 @@ void setup() {
   //    // Можна домалювати галочку "Sent" тут
   // }
 
-  // bootCount++;
+  bootCount++;
   // drawScreen();
 
   esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
