@@ -134,7 +134,7 @@ void startConfigMode() {
   wm.setSaveConfigCallback(saveConfigCallback);
 
   // Створюємо точку доступу, якщо не підключились
-  if (!wm.autoConnect("ESP32-Setup")) {
+  if (!wm.startConfigPortal("ESP32-Setup")) { //autoConnect("ESP32-Setup")) {
     delay(3000);
     ESP.restart();
   }
